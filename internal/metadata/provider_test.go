@@ -312,7 +312,7 @@ func TestStopProvider(t *testing.T) {
 	require.NoError(t, err)
 }
 
-func TestPluginInterface(t *testing.T) {
+func TestPluginInterface(_ *testing.T) {
 	var _ sdkplugin.ProviderPlugin = (*Plugin)(nil)
 }
 
