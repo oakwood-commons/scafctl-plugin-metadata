@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"runtime"
 	"testing"
 
 	sdkplugin "github.com/oakwood-commons/scafctl-plugin-sdk/plugin"
@@ -37,6 +38,7 @@ func TestGetProviderDescriptor(t *testing.T) {
 	assert.Equal(t, "Core", d.Category)
 	assert.Contains(t, d.Tags, "metadata")
 	assert.Contains(t, d.Tags, "introspection")
+	assert.Contains(t, d.Tags, "platform")
 }
 
 func TestGetProviderDescriptor_UnknownProvider(t *testing.T) {
@@ -175,6 +177,11 @@ func TestExecuteProvider_FullContext(t *testing.T) {
 	assert.Equal(t, "A test solution", solMap["description"])
 	assert.Equal(t, "testing", solMap["category"])
 	assert.Equal(t, []string{"test", "example"}, solMap["tags"])
+
+	// Verify platform info.
+	assert.Equal(t, runtime.GOOS, result["os"])
+	assert.Equal(t, runtime.GOARCH, result["arch"])
+	assert.NotNil(t, result["shell"]) // shell is always set (may be empty string)
 }
 
 func TestExecuteProvider_APIEntrypoint(t *testing.T) {
@@ -232,6 +239,10 @@ func TestExecuteProvider_NoContext(t *testing.T) {
 	// CWD should fall back to os.Getwd().
 	expectedCwd, _ := os.Getwd()
 	assert.Equal(t, expectedCwd, result["cwd"])
+
+	// os and arch should always be populated.
+	assert.Equal(t, runtime.GOOS, result["os"])
+	assert.Equal(t, runtime.GOARCH, result["arch"])
 }
 
 func TestExecuteProvider_NoSolutionMetadata(t *testing.T) {
@@ -302,6 +313,125 @@ func TestStopProvider(t *testing.T) {
 }
 
 func TestPluginInterface(t *testing.T) {
-	// Verify Plugin satisfies the ProviderPlugin interface at compile time.
 	var _ sdkplugin.ProviderPlugin = (*Plugin)(nil)
+}
+
+// ── Shell detection tests ──────────────────────────────────────────────────
+
+func TestDetectShell_FromSHELL(t *testing.T) {
+	t.Setenv("SHELL", "/bin/zsh")
+	assert.Equal(t, "zsh", detectShell())
+}
+
+func TestDetectShell_FromComSpec(t *testing.T) {
+	t.Setenv("SHELL", "")
+	t.Setenv("PSModulePath", "")
+	t.Setenv("ComSpec", "/c/Windows/system32/cmd.exe")
+	assert.Equal(t, "cmd.exe", detectShell())
+}
+
+func TestDetectShell_Empty(t *testing.T) {
+	t.Setenv("SHELL", "")
+	t.Setenv("PSModulePath", "")
+	t.Setenv("ComSpec", "")
+	assert.Equal(t, "", detectShell())
+}
+
+func TestDetectShell_SHELLTakesPrecedence(t *testing.T) {
+	// $SHELL should win even if PSModulePath and ComSpec are set.
+	t.Setenv("SHELL", "/usr/bin/bash")
+	t.Setenv("PSModulePath", "C:\\modules")
+	t.Setenv("ComSpec", "C:\\Windows\\system32\\cmd.exe")
+	assert.Equal(t, "bash", detectShell())
+}
+
+func TestDetectShell_PSModulePath_Pwsh(t *testing.T) {
+	origGoos := goosFunc
+	origParent := parentProcessNameFunc
+	t.Cleanup(func() {
+		goosFunc = origGoos
+		parentProcessNameFunc = origParent
+	})
+
+	goosFunc = func() string { return "windows" }
+	parentProcessNameFunc = func() string { return "pwsh.exe" }
+
+	t.Setenv("SHELL", "")
+	t.Setenv("PSModulePath", `C:\Users\test\Documents\PowerShell\Modules`)
+	t.Setenv("ComSpec", `C:\Windows\system32\cmd.exe`)
+
+	assert.Equal(t, "pwsh", detectShell())
+}
+
+func TestDetectShell_PSModulePath_WindowsPowerShell(t *testing.T) {
+	origGoos := goosFunc
+	origParent := parentProcessNameFunc
+	t.Cleanup(func() {
+		goosFunc = origGoos
+		parentProcessNameFunc = origParent
+	})
+
+	goosFunc = func() string { return "windows" }
+	parentProcessNameFunc = func() string { return "powershell.exe" }
+
+	t.Setenv("SHELL", "")
+	t.Setenv("PSModulePath", `C:\Users\test\Documents\PowerShell\Modules`)
+	t.Setenv("ComSpec", `C:\Windows\system32\cmd.exe`)
+
+	assert.Equal(t, "powershell", detectShell())
+}
+
+func TestDetectShell_GitBashOnWindows(t *testing.T) {
+	// Git Bash sets $SHELL, so it takes precedence.
+	t.Setenv("SHELL", "/usr/bin/bash")
+	t.Setenv("PSModulePath", "")
+	t.Setenv("ComSpec", `C:\Windows\system32\cmd.exe`)
+
+	assert.Equal(t, "bash", detectShell())
+}
+
+func TestDetectShell_CmdExeFallback(t *testing.T) {
+	origGoos := goosFunc
+	t.Cleanup(func() { goosFunc = origGoos })
+
+	goosFunc = func() string { return "windows" }
+
+	t.Setenv("SHELL", "")
+	t.Setenv("PSModulePath", "")
+	// Use forward slashes so filepath.Base works correctly on all platforms.
+	t.Setenv("ComSpec", "C:/Windows/system32/cmd.exe")
+
+	assert.Equal(t, "cmd.exe", detectShell())
+}
+
+func TestDetectPowerShellVariant_Pwsh(t *testing.T) {
+	orig := parentProcessNameFunc
+	t.Cleanup(func() { parentProcessNameFunc = orig })
+
+	parentProcessNameFunc = func() string { return "pwsh.exe" }
+	assert.Equal(t, "pwsh", detectPowerShellVariant())
+}
+
+func TestDetectPowerShellVariant_WindowsPowerShell(t *testing.T) {
+	orig := parentProcessNameFunc
+	t.Cleanup(func() { parentProcessNameFunc = orig })
+
+	parentProcessNameFunc = func() string { return "powershell.exe" }
+	assert.Equal(t, "powershell", detectPowerShellVariant())
+}
+
+func TestDetectPowerShellVariant_Unknown(t *testing.T) {
+	orig := parentProcessNameFunc
+	t.Cleanup(func() { parentProcessNameFunc = orig })
+
+	parentProcessNameFunc = func() string { return "" }
+	assert.Equal(t, "pwsh", detectPowerShellVariant())
+}
+
+func TestDetectPowerShellVariant_UnexpectedParent(t *testing.T) {
+	orig := parentProcessNameFunc
+	t.Cleanup(func() { parentProcessNameFunc = orig })
+
+	parentProcessNameFunc = func() string { return "explorer.exe" }
+	assert.Equal(t, "pwsh", detectPowerShellVariant())
 }
