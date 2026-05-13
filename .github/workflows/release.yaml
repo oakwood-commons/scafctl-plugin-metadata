@@ -43,6 +43,8 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   publish-oci:
+    outputs:
+      image_ref: ${{ steps.push.outputs.image_ref }}
     name: Publish OCI Artifact
     needs: release
     runs-on: ubuntu-latest
@@ -61,6 +63,9 @@ jobs:
           tar xzf "${TMP_DIR}"/scafctl_*_Linux_x86_64.tar.gz -C "${TMP_DIR}"
           sudo mv "${TMP_DIR}/scafctl" /usr/local/bin/scafctl
           rm -rf "${TMP_DIR}"
+
+      - name: Install crane
+        uses: imjasonh/setup-crane@v0.5
 
       - name: Login to GitHub Container Registry
         run: |
@@ -99,6 +104,7 @@ jobs:
           fi
 
       - name: Build and push OCI artifact
+        id: push
         run: |
           VERSION="${GITHUB_REF#refs/tags/v}"
           BINARY="scafctl-plugin-metadata"
@@ -118,3 +124,18 @@ jobs:
             --catalog "ghcr.io/oakwood-commons" \
             --kind "provider" \
             --force
+
+          # Resolve the pushed manifest digest for cosign signing
+          DIGEST=$(crane digest "ghcr.io/oakwood-commons/providers/metadata:${VERSION}")
+          echo "image_ref=ghcr.io/oakwood-commons/providers/metadata@${DIGEST}" >> "$GITHUB_OUTPUT"
+
+  sign:
+    name: Sign OCI Artifact
+    needs: publish-oci
+    if: needs.publish-oci.outputs.image_ref != ''
+    permissions:
+      id-token: write
+      packages: write
+    uses: oakwood-commons/scafctl/.github/workflows/sign-plugin.yml@sign-plugin/v1
+    with:
+      image-ref: ${{ needs.publish-oci.outputs.image_ref }}
