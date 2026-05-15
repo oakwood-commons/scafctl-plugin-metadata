@@ -3,12 +3,12 @@ module github.com/oakwood-commons/scafctl-plugin-metadata
 go 1.26.2
 
 require (
-	github.com/Masterminds/semver/v3 v3.4.0
+	github.com/Masterminds/semver/v3 v3.5.0
 	github.com/go-logr/logr v1.4.3
-	github.com/google/jsonschema-go v0.4.2
-	github.com/oakwood-commons/scafctl-plugin-sdk v0.2.0
+	github.com/google/jsonschema-go v0.4.3
+	github.com/oakwood-commons/scafctl-plugin-sdk v0.4.0
 	github.com/stretchr/testify v1.11.1
-	golang.org/x/sys v0.40.0
+	golang.org/x/sys v0.43.0
 )
 
 require (
