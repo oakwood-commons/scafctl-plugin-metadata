@@ -279,6 +279,303 @@ func TestExecuteProvider_UnknownProvider(t *testing.T) {
 	assert.Contains(t, err.Error(), "unknown provider")
 }
 
+// marshalMetadata is a test helper that JSON-encodes host metadata.
+func marshalMetadata(t *testing.T, meta hostMetadata) json.RawMessage {
+	t.Helper()
+	raw, err := json.Marshal(meta)
+	require.NoError(t, err)
+	return raw
+}
+
+// TestExecuteProvider_PerExecutionSettings simulates a pool-mode host that
+// delivers stale/empty config via ConfigureProvider but supplies the correct,
+// fresh metadata per execution via context. The per-execution settings must win.
+func TestExecuteProvider_PerExecutionSettings(t *testing.T) {
+	p := NewPlugin()
+
+	// Configure with stale/empty host metadata (pool-mode load-time config).
+	err := p.ConfigureProvider(context.Background(), ProviderName, sdkplugin.ProviderConfig{
+		Settings: map[string]json.RawMessage{
+			"metadata": marshalMetadata(t, hostMetadata{}),
+		},
+	})
+	require.NoError(t, err)
+
+	// Per-execution settings carry the correct values for this solution.
+	perExec := hostMetadata{
+		BuildVersion: "9.9.9",
+		Commit:       "def456",
+		BuildTime:    "2026-07-27T00:00:00Z",
+		Entrypoint:   "api",
+		Command:      "api/v1/solutions/run",
+		Args:         []string{"scafctl-api"},
+		Solution: solutionMeta{
+			Name:    "pool-solution",
+			Version: "2.0.0",
+			Source:  "./pool-solution.yaml",
+		},
+	}
+	ctx := sdkprovider.WithSettings(context.Background(), map[string]json.RawMessage{
+		"metadata": marshalMetadata(t, perExec),
+	})
+
+	out, err := p.ExecuteProvider(ctx, ProviderName, nil)
+	require.NoError(t, err)
+
+	result := out.Data.(map[string]any)
+
+	versionMap := result["version"].(map[string]any)
+	assert.Equal(t, "9.9.9", versionMap["buildVersion"])
+	assert.Equal(t, "def456", versionMap["commit"])
+	assert.Equal(t, []string{"scafctl-api"}, result["args"])
+	assert.Equal(t, "api", result["entrypoint"])
+	assert.Equal(t, "api/v1/solutions/run", result["command"])
+
+	solMap := result["solution"].(map[string]any)
+	assert.Equal(t, "pool-solution", solMap["name"])
+	assert.Equal(t, "2.0.0", solMap["version"])
+	assert.Equal(t, "./pool-solution.yaml", solMap["source"])
+}
+
+// TestExecuteProvider_PerExecutionSettingsOverrideConfigure ensures that when
+// both a ConfigureProvider copy and per-execution settings are present, the
+// per-execution values take precedence.
+func TestExecuteProvider_PerExecutionSettingsOverrideConfigure(t *testing.T) {
+	p := NewPlugin()
+
+	err := p.ConfigureProvider(context.Background(), ProviderName, sdkplugin.ProviderConfig{
+		Settings: map[string]json.RawMessage{
+			"metadata": marshalMetadata(t, hostMetadata{
+				BuildVersion: "1.0.0",
+				Entrypoint:   "cli",
+				Command:      "scafctl/run/solution",
+			}),
+		},
+	})
+	require.NoError(t, err)
+
+	ctx := sdkprovider.WithSettings(context.Background(), map[string]json.RawMessage{
+		"metadata": marshalMetadata(t, hostMetadata{
+			BuildVersion: "2.0.0",
+			Entrypoint:   "api",
+			Command:      "api/v1/solutions/run",
+		}),
+	})
+
+	out, err := p.ExecuteProvider(ctx, ProviderName, nil)
+	require.NoError(t, err)
+
+	result := out.Data.(map[string]any)
+	assert.Equal(t, "2.0.0", result["version"].(map[string]any)["buildVersion"])
+	assert.Equal(t, "api", result["entrypoint"])
+	assert.Equal(t, "api/v1/solutions/run", result["command"])
+}
+
+// TestExecuteProvider_MalformedPerExecutionSettings verifies the provider falls
+// back to the stored ConfigureProvider copy when per-execution settings are
+// present but not valid JSON.
+func TestExecuteProvider_MalformedPerExecutionSettings(t *testing.T) {
+	p := NewPlugin()
+
+	err := p.ConfigureProvider(context.Background(), ProviderName, sdkplugin.ProviderConfig{
+		Settings: map[string]json.RawMessage{
+			"metadata": marshalMetadata(t, hostMetadata{
+				BuildVersion: "1.0.0",
+				Entrypoint:   "cli",
+			}),
+		},
+	})
+	require.NoError(t, err)
+
+	ctx := sdkprovider.WithSettings(context.Background(), map[string]json.RawMessage{
+		"metadata": json.RawMessage(`{invalid`),
+	})
+
+	out, err := p.ExecuteProvider(ctx, ProviderName, nil)
+	require.NoError(t, err)
+
+	result := out.Data.(map[string]any)
+	assert.Equal(t, "1.0.0", result["version"].(map[string]any)["buildVersion"])
+	assert.Equal(t, "cli", result["entrypoint"])
+}
+
+// TestExecuteProvider_EmptyPerExecutionSettings verifies the provider falls back
+// to the stored ConfigureProvider copy when the per-execution payload is present
+// but empty (null / {} / all zero values), rather than blanking out valid config.
+func TestExecuteProvider_EmptyPerExecutionSettings(t *testing.T) {
+	cfg := hostMetadata{
+		BuildVersion: "1.0.0",
+		Entrypoint:   "cli",
+		Command:      "scafctl/run/solution",
+		Solution: solutionMeta{
+			Name:    "cfg-solution",
+			Version: "1.0.0",
+			Source:  "./cfg-solution.yaml",
+		},
+	}
+
+	for _, tc := range []struct {
+		name string
+		raw  json.RawMessage
+	}{
+		{name: "null", raw: json.RawMessage(`null`)},
+		{name: "empty object", raw: json.RawMessage(`{}`)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := NewPlugin()
+			require.NoError(t, p.ConfigureProvider(context.Background(), ProviderName, sdkplugin.ProviderConfig{
+				Settings: map[string]json.RawMessage{"metadata": marshalMetadata(t, cfg)},
+			}))
+
+			ctx := sdkprovider.WithSettings(context.Background(), map[string]json.RawMessage{
+				"metadata": tc.raw,
+			})
+
+			out, err := p.ExecuteProvider(ctx, ProviderName, nil)
+			require.NoError(t, err)
+
+			result := out.Data.(map[string]any)
+			assert.Equal(t, "1.0.0", result["version"].(map[string]any)["buildVersion"])
+			assert.Equal(t, "cli", result["entrypoint"])
+			assert.Equal(t, "scafctl/run/solution", result["command"])
+
+			solMap := result["solution"].(map[string]any)
+			assert.Equal(t, "cfg-solution", solMap["name"])
+			assert.Equal(t, "./cfg-solution.yaml", solMap["source"])
+		})
+	}
+}
+// context settings are present but carry no "metadata" key, the provider falls
+// back to the stored ConfigureProvider copy.
+func TestExecuteProvider_PerExecutionSettingsWithoutMetadataKey(t *testing.T) {
+	p := NewPlugin()
+
+	err := p.ConfigureProvider(context.Background(), ProviderName, sdkplugin.ProviderConfig{
+		Settings: map[string]json.RawMessage{
+			"metadata": marshalMetadata(t, hostMetadata{BuildVersion: "1.0.0"}),
+		},
+	})
+	require.NoError(t, err)
+
+	ctx := sdkprovider.WithSettings(context.Background(), map[string]json.RawMessage{
+		"other": json.RawMessage(`{}`),
+	})
+
+	out, err := p.ExecuteProvider(ctx, ProviderName, nil)
+	require.NoError(t, err)
+
+	result := out.Data.(map[string]any)
+	assert.Equal(t, "1.0.0", result["version"].(map[string]any)["buildVersion"])
+}
+
+// TestExecuteProvider_SolutionMetadataFromContext verifies the canonical
+// per-execution solution metadata channel is preferred over the solution
+// embedded in the host settings, and that the source field is surfaced.
+func TestExecuteProvider_SolutionMetadataFromContext(t *testing.T) {
+	p := NewPlugin()
+
+	// Host settings carry a different (stale) solution.
+	ctx := sdkprovider.WithSettings(context.Background(), map[string]json.RawMessage{
+		"metadata": marshalMetadata(t, hostMetadata{
+			Entrypoint: "cli",
+			Solution: solutionMeta{
+				Name:    "stale-solution",
+				Version: "0.0.1",
+			},
+		}),
+	})
+
+	// Canonical solution metadata from context should win.
+	ctx = sdkprovider.WithSolutionMetadata(ctx, &sdkprovider.SolutionMeta{
+		Name:        "fresh-solution",
+		Version:     "3.0.0",
+		DisplayName: "Fresh Solution",
+		Description: "The current solution",
+		Category:    "infrastructure",
+		Tags:        []string{"a", "b"},
+		Source:      "./fresh-solution.yaml",
+	})
+
+	out, err := p.ExecuteProvider(ctx, ProviderName, nil)
+	require.NoError(t, err)
+
+	solMap := out.Data.(map[string]any)["solution"].(map[string]any)
+	assert.Equal(t, "fresh-solution", solMap["name"])
+	assert.Equal(t, "3.0.0", solMap["version"])
+	assert.Equal(t, "Fresh Solution", solMap["displayName"])
+	assert.Equal(t, "The current solution", solMap["description"])
+	assert.Equal(t, "infrastructure", solMap["category"])
+	assert.Equal(t, []string{"a", "b"}, solMap["tags"])
+	assert.Equal(t, "./fresh-solution.yaml", solMap["source"])
+}
+
+// TestExecuteProvider_SolutionSourceFromConfigure verifies the source field is
+// surfaced from the stored ConfigureProvider copy when no context solution
+// metadata is present (older host).
+func TestExecuteProvider_SolutionSourceFromConfigure(t *testing.T) {
+	p := NewPlugin()
+
+	err := p.ConfigureProvider(context.Background(), ProviderName, sdkplugin.ProviderConfig{
+		Settings: map[string]json.RawMessage{
+			"metadata": marshalMetadata(t, hostMetadata{
+				Solution: solutionMeta{
+					Name:    "cfg-solution",
+					Version: "1.0.0",
+					Source:  "./cfg-solution.yaml",
+				},
+			}),
+		},
+	})
+	require.NoError(t, err)
+
+	out, err := p.ExecuteProvider(context.Background(), ProviderName, nil)
+	require.NoError(t, err)
+
+	solMap := out.Data.(map[string]any)["solution"].(map[string]any)
+	assert.Equal(t, "cfg-solution", solMap["name"])
+	assert.Equal(t, "./cfg-solution.yaml", solMap["source"])
+}
+
+// TestExecuteProvider_PoolAndPerCallIdentical asserts that identical host data
+// delivered via ConfigureProvider (per-call host) and via context
+// (pool-mode host) produces identical output.
+func TestExecuteProvider_PoolAndPerCallIdentical(t *testing.T) {
+	meta := hostMetadata{
+		BuildVersion: "1.2.3",
+		Commit:       "abc123",
+		BuildTime:    "2026-01-01T00:00:00Z",
+		Entrypoint:   "cli",
+		Command:      "scafctl/run/solution",
+		Args:         []string{"scafctl", "run", "solution"},
+		Solution: solutionMeta{
+			Name:    "shared-solution",
+			Version: "1.0.0",
+			Source:  "./shared.yaml",
+		},
+	}
+
+	// Per-call host: data via ConfigureProvider, executed with a bare context.
+	perCall := NewPlugin()
+	require.NoError(t, perCall.ConfigureProvider(context.Background(), ProviderName, sdkplugin.ProviderConfig{
+		Settings: map[string]json.RawMessage{"metadata": marshalMetadata(t, meta)},
+	}))
+	perCallOut, err := perCall.ExecuteProvider(context.Background(), ProviderName, nil)
+	require.NoError(t, err)
+
+	// Pool-mode host: empty config, data via per-execution context.
+	pool := NewPlugin()
+	require.NoError(t, pool.ConfigureProvider(context.Background(), ProviderName, sdkplugin.ProviderConfig{
+		Settings: map[string]json.RawMessage{"metadata": marshalMetadata(t, hostMetadata{})},
+	}))
+	poolCtx := sdkprovider.WithSettings(context.Background(), map[string]json.RawMessage{
+		"metadata": marshalMetadata(t, meta),
+	})
+	poolOut, err := pool.ExecuteProvider(poolCtx, ProviderName, nil)
+	require.NoError(t, err)
+
+	assert.Equal(t, perCallOut.Data, poolOut.Data)
+}
+
 func TestDescribeWhatIf(t *testing.T) {
 	p := NewPlugin()
 	desc, err := p.DescribeWhatIf(context.Background(), ProviderName, nil)
