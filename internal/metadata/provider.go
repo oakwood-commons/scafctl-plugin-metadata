@@ -5,8 +5,11 @@
 // gathered from the plugin configuration and execution context.
 //
 // Host-side data (version, entrypoint, args, solution metadata) is received via
-// ConfigureProvider and stored in the plugin. Per-execution data (working
-// directory) comes from the SDK context helpers.
+// ConfigureProvider and stored in the plugin. Under pool-mode hosts that copy is
+// stale, so ExecuteProvider prefers the effective per-execution host settings
+// and solution metadata delivered via the SDK context accessors, falling back to
+// the stored copy for older hosts. Per-execution data (working directory) comes
+// from the SDK context helpers.
 package metadata
 
 import (
@@ -31,7 +34,7 @@ const (
 	ProviderName = "metadata"
 
 	// Version is the provider version.
-	Version = "3.1.0"
+	Version = "3.2.0"
 )
 
 // parentProcessNameFunc returns the parent process executable name.
@@ -68,6 +71,7 @@ type solutionMeta struct {
 	Description string   `json:"description"`
 	Category    string   `json:"category"`
 	Tags        []string `json:"tags"`
+	Source      string   `json:"source"`
 }
 
 // Plugin implements the scafctl ProviderPlugin interface.
@@ -129,6 +133,7 @@ func (p *Plugin) GetProviderDescriptor(_ context.Context, providerName string) (
 						"description": sdkhelper.StringProp("Solution description"),
 						"category":    sdkhelper.StringProp("Solution category"),
 						"tags":        sdkhelper.ArrayProp("Solution tags", sdkhelper.WithItems(sdkhelper.StringProp("A tag"))),
+						"source":      sdkhelper.StringProp("Where the solution was loaded from (file path, catalog reference, or URL)"),
 					}),
 					"os":    sdkhelper.StringProp("Operating system (runtime.GOOS)", sdkhelper.WithEnum("aix", "android", "darwin", "dragonfly", "freebsd", "illumos", "ios", "js", "linux", "netbsd", "openbsd", "plan9", "solaris", "wasip1", "windows")),
 					"arch":  sdkhelper.StringProp("CPU architecture (runtime.GOARCH)", sdkhelper.WithEnum("386", "amd64", "arm", "arm64", "loong64", "mips", "mips64", "mips64le", "mipsle", "ppc64", "ppc64le", "riscv64", "s390x", "wasm")),
@@ -165,6 +170,15 @@ func (p *Plugin) ConfigureProvider(_ context.Context, providerName string, cfg s
 
 // ExecuteProvider gathers runtime metadata from the host configuration and
 // execution context.
+//
+// Under a pool-mode host (MCP/API server) the plugin process is configured once
+// at load time, so the copy stored via ConfigureProvider is stale. The SDK
+// therefore delivers the effective per-execution host settings via
+// sdkprovider.SettingsFromContext and canonical solution metadata via
+// sdkprovider.SolutionMetadataFromContext. This method prefers those
+// context-scoped values and falls back to the ConfigureProvider copy when they
+// are absent (older hosts), so output is identical under pool-mode and per-call
+// hosts.
 func (p *Plugin) ExecuteProvider(ctx context.Context, providerName string, _ map[string]any) (*sdkprovider.Output, error) {
 	if providerName != ProviderName {
 		return nil, fmt.Errorf("unknown provider: %s", providerName)
@@ -173,15 +187,19 @@ func (p *Plugin) ExecuteProvider(ctx context.Context, providerName string, _ map
 	lgr := logr.FromContextOrDiscard(ctx)
 	lgr.V(1).Info("executing provider", "provider", ProviderName)
 
+	// Resolve the effective host metadata: prefer per-execution settings
+	// delivered via context, falling back to the ConfigureProvider copy.
+	host := p.effectiveHost(ctx)
+
 	// Build version info from host config.
 	version := map[string]any{
-		"buildVersion": p.host.BuildVersion,
-		"commit":       p.host.Commit,
-		"buildTime":    p.host.BuildTime,
+		"buildVersion": host.BuildVersion,
+		"commit":       host.Commit,
+		"buildTime":    host.BuildTime,
 	}
 
 	// CLI arguments from host config.
-	args := p.host.Args
+	args := host.Args
 	if args == nil {
 		args = os.Args // Fallback to plugin process args if host didn't send them.
 	}
@@ -193,27 +211,11 @@ func (p *Plugin) ExecuteProvider(ctx context.Context, providerName string, _ map
 	}
 
 	// Entrypoint and command path from host config.
-	entrypoint := p.host.Entrypoint
+	entrypoint := host.Entrypoint
 	if entrypoint == "" {
 		entrypoint = "unknown"
 	}
-	command := p.host.Command
-
-	// Solution metadata from host config.
-	var solData map[string]any
-	sol := p.host.Solution
-	if sol.Name != "" || sol.Version != "" {
-		solData = map[string]any{
-			"name":        sol.Name,
-			"version":     sol.Version,
-			"displayName": sol.DisplayName,
-			"description": sol.Description,
-			"category":    sol.Category,
-			"tags":        sol.Tags,
-		}
-	} else {
-		solData = map[string]any{}
-	}
+	command := host.Command
 
 	result := map[string]any{
 		"version":    version,
@@ -221,7 +223,7 @@ func (p *Plugin) ExecuteProvider(ctx context.Context, providerName string, _ map
 		"cwd":        cwd,
 		"entrypoint": entrypoint,
 		"command":    command,
-		"solution":   solData,
+		"solution":   solutionData(ctx, host),
 		"os":         runtime.GOOS,
 		"arch":       runtime.GOARCH,
 		"shell":      detectShell(),
@@ -229,6 +231,64 @@ func (p *Plugin) ExecuteProvider(ctx context.Context, providerName string, _ map
 
 	lgr.V(1).Info("provider completed", "provider", ProviderName)
 	return &sdkprovider.Output{Data: result}, nil
+}
+
+// effectiveHost returns the host metadata for this execution. It prefers the
+// per-execution settings delivered via context (the SDK server merges
+// execute-time over configure-time settings, so this is correct under both
+// pool-mode and per-call hosts) and falls back to the ConfigureProvider copy
+// when the context carries no settings (older hosts).
+func (p *Plugin) effectiveHost(ctx context.Context) hostMetadata {
+	settings, ok := sdkprovider.SettingsFromContext(ctx)
+	if !ok {
+		return p.host
+	}
+	raw, ok := settings["metadata"]
+	if !ok {
+		return p.host
+	}
+	var host hostMetadata
+	if err := json.Unmarshal(raw, &host); err != nil {
+		// Malformed per-execution settings: fall back to the stored copy.
+		return p.host
+	}
+	return host
+}
+
+// solutionData builds the solution output map. It prefers the canonical
+// per-execution solution metadata delivered via context
+// (sdkprovider.SolutionMetadataFromContext), which is the fresh, authoritative
+// source under pool-mode hosts. It falls back to the solution embedded in the
+// effective host metadata when the accessor is absent (older hosts), and to an
+// empty map when neither carries solution data.
+func solutionData(ctx context.Context, host hostMetadata) map[string]any {
+	if meta, ok := sdkprovider.SolutionMetadataFromContext(ctx); ok && meta != nil &&
+		(meta.Name != "" || meta.Version != "") {
+		return map[string]any{
+			"name":        meta.Name,
+			"version":     meta.Version,
+			"displayName": meta.DisplayName,
+			"description": meta.Description,
+			"category":    meta.Category,
+			"tags":        meta.Tags,
+			"source":      meta.Source,
+		}
+	}
+
+	sol := host.Solution
+	if sol.Name != "" || sol.Version != "" {
+		return map[string]any{
+			"name":        sol.Name,
+			"version":     sol.Version,
+			"displayName": sol.DisplayName,
+			"description": sol.Description,
+			"category":    sol.Category,
+			"tags":        sol.Tags,
+			"source":      sol.Source,
+		}
+	}
+
+	return map[string]any{}
 }
 
 // DescribeWhatIf returns a description of what the provider would do.
