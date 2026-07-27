@@ -70,7 +70,8 @@ jobs:
       - name: Login to GitHub Container Registry
         run: |
           mkdir -p ~/.docker
-          echo '{"auths":{"ghcr.io":{"auth":"'"$(echo -n "${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" | base64)"'"}}}' > ~/.docker/config.json
+          AUTH=$(printf '%s' "${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" | base64 -w 0)
+          printf '{"auths":{"ghcr.io":{"auth":"%s"}}}' "${AUTH}" > ~/.docker/config.json
 
       - name: Download release archives
         env:
