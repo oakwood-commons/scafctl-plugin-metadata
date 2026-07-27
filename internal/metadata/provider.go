@@ -237,7 +237,8 @@ func (p *Plugin) ExecuteProvider(ctx context.Context, providerName string, _ map
 // per-execution settings delivered via context (the SDK server merges
 // execute-time over configure-time settings, so this is correct under both
 // pool-mode and per-call hosts) and falls back to the ConfigureProvider copy
-// when the context carries no settings (older hosts).
+// when the context carries no settings (older hosts) or when the per-execution
+// payload is empty.
 func (p *Plugin) effectiveHost(ctx context.Context) hostMetadata {
 	settings, ok := sdkprovider.SettingsFromContext(ctx)
 	if !ok {
@@ -252,7 +253,32 @@ func (p *Plugin) effectiveHost(ctx context.Context) hostMetadata {
 		// Malformed per-execution settings: fall back to the stored copy.
 		return p.host
 	}
+	if host.isEmpty() {
+		// Empty per-execution payload (e.g. null, {}, or all zero values):
+		// keep the stored ConfigureProvider copy rather than blanking it out.
+		return p.host
+	}
 	return host
+}
+
+// isEmpty reports whether the host metadata carries no meaningful data. It is
+// used to avoid overriding a valid ConfigureProvider copy with an empty
+// per-execution payload (e.g. null, {}, or all zero values).
+func (h hostMetadata) isEmpty() bool {
+	s := h.Solution
+	return h.BuildVersion == "" &&
+		h.Commit == "" &&
+		h.BuildTime == "" &&
+		h.Entrypoint == "" &&
+		h.Command == "" &&
+		len(h.Args) == 0 &&
+		s.Name == "" &&
+		s.Version == "" &&
+		s.DisplayName == "" &&
+		s.Description == "" &&
+		s.Category == "" &&
+		len(s.Tags) == 0 &&
+		s.Source == ""
 }
 
 // solutionData builds the solution output map. It prefers the canonical

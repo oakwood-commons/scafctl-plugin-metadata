@@ -399,7 +399,52 @@ func TestExecuteProvider_MalformedPerExecutionSettings(t *testing.T) {
 	assert.Equal(t, "cli", result["entrypoint"])
 }
 
-// TestExecuteProvider_PerExecutionSettingsWithoutMetadataKey verifies that when
+// TestExecuteProvider_EmptyPerExecutionSettings verifies the provider falls back
+// to the stored ConfigureProvider copy when the per-execution payload is present
+// but empty (null / {} / all zero values), rather than blanking out valid config.
+func TestExecuteProvider_EmptyPerExecutionSettings(t *testing.T) {
+	cfg := hostMetadata{
+		BuildVersion: "1.0.0",
+		Entrypoint:   "cli",
+		Command:      "scafctl/run/solution",
+		Solution: solutionMeta{
+			Name:    "cfg-solution",
+			Version: "1.0.0",
+			Source:  "./cfg-solution.yaml",
+		},
+	}
+
+	for _, tc := range []struct {
+		name string
+		raw  json.RawMessage
+	}{
+		{name: "null", raw: json.RawMessage(`null`)},
+		{name: "empty object", raw: json.RawMessage(`{}`)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := NewPlugin()
+			require.NoError(t, p.ConfigureProvider(context.Background(), ProviderName, sdkplugin.ProviderConfig{
+				Settings: map[string]json.RawMessage{"metadata": marshalMetadata(t, cfg)},
+			}))
+
+			ctx := sdkprovider.WithSettings(context.Background(), map[string]json.RawMessage{
+				"metadata": tc.raw,
+			})
+
+			out, err := p.ExecuteProvider(ctx, ProviderName, nil)
+			require.NoError(t, err)
+
+			result := out.Data.(map[string]any)
+			assert.Equal(t, "1.0.0", result["version"].(map[string]any)["buildVersion"])
+			assert.Equal(t, "cli", result["entrypoint"])
+			assert.Equal(t, "scafctl/run/solution", result["command"])
+
+			solMap := result["solution"].(map[string]any)
+			assert.Equal(t, "cfg-solution", solMap["name"])
+			assert.Equal(t, "./cfg-solution.yaml", solMap["source"])
+		})
+	}
+}
 // context settings are present but carry no "metadata" key, the provider falls
 // back to the stored ConfigureProvider copy.
 func TestExecuteProvider_PerExecutionSettingsWithoutMetadataKey(t *testing.T) {
